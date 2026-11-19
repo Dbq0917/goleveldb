@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -84,6 +85,68 @@ type fileStorage struct {
 	// Opened file counter; if open < 0 means closed.
 	open int
 	day  int
+
+	// handles tracks the open handles of each file, so that a file that
+	// is still referenced (e.g. by an iterator) will not be removed right
+	// away; the removal is deferred until the last handle is closed.
+	// The reference count is atomic, hence neither acquiring/releasing a
+	// reference nor the reference check on the removal path requires a
+	// lock.
+	handles sync.Map // map[FileDesc]*fileHandleRef
+}
+
+// fileHandleRef keeps track of the open handles of a single file along
+// with a pending-removal mark. All fields are manipulated atomically.
+type fileHandleRef struct {
+	refs    int32 // number of open handles
+	removed int32 // non-zero if removal was requested while still referenced
+}
+
+// acquireHandle acquires a new handle reference for the given file. The
+// reference must be released with releaseHandle once the handle is closed.
+func (fs *fileStorage) acquireHandle(fd FileDesc) *fileHandleRef {
+	v, _ := fs.handles.LoadOrStore(fd, &fileHandleRef{})
+	h := v.(*fileHandleRef)
+	atomic.AddInt32(&h.refs, 1)
+	return h
+}
+
+// releaseHandle releases a handle reference previously acquired with
+// acquireHandle. If the file was marked for removal while still referenced,
+// the actual removal happens now that the last handle is gone.
+func (fs *fileStorage) releaseHandle(fd FileDesc, h *fileHandleRef) {
+	if atomic.AddInt32(&h.refs, -1) > 0 {
+		return
+	}
+	if atomic.LoadInt32(&h.removed) == 0 {
+		return
+	}
+	// Deferred reclamation of a file whose removal was requested while
+	// it was still referenced.
+	if err := fs.removeFile(fd); err != nil && !os.IsNotExist(err) {
+		fs.Log(fmt.Sprintf("remove %s: %v (deferred)", fd, err))
+	}
+	// Drop the registry entry if it still refers to this record.
+	if v, ok := fs.handles.Load(fd); ok && v == h {
+		fs.handles.Delete(fd)
+	}
+}
+
+// removeFile removes the given file from the file system, falling back to
+// the old file name for table files.
+func (fs *fileStorage) removeFile(fd FileDesc) error {
+	err := os.Remove(filepath.Join(fs.path, fsGenName(fd)))
+	if err != nil {
+		if fsHasOldName(fd) && os.IsNotExist(err) {
+			if e1 := os.Remove(filepath.Join(fs.path, fsGenOldName(fd))); !os.IsNotExist(e1) {
+				fs.Log(fmt.Sprintf("remove %s: %v (old name)", fd, err))
+				err = e1
+			}
+		} else {
+			fs.Log(fmt.Sprintf("remove %s: %v", fd, err))
+		}
+	}
+	return err
 }
 
 // OpenFile returns a new filesystem-backed storage implementation with the given
@@ -475,24 +538,34 @@ func (fs *fileStorage) Open(fd FileDesc) (Reader, error) {
 		return nil, ErrInvalidFile
 	}
 
+	h := fs.acquireHandle(fd)
+	if atomic.LoadInt32(&h.removed) != 0 {
+		// The file has been removed; it is only kept around until the
+		// last referenced handle is closed.
+		fs.releaseHandle(fd, h)
+		return nil, os.ErrNotExist
+	}
+
 	fs.mu.Lock()
-	defer fs.mu.Unlock()
 	if fs.open < 0 {
+		fs.mu.Unlock()
+		fs.releaseHandle(fd, h)
 		return nil, ErrClosed
 	}
 	of, err := os.OpenFile(filepath.Join(fs.path, fsGenName(fd)), os.O_RDONLY, 0)
 	if err != nil {
 		if fsHasOldName(fd) && os.IsNotExist(err) {
 			of, err = os.OpenFile(filepath.Join(fs.path, fsGenOldName(fd)), os.O_RDONLY, 0)
-			if err == nil {
-				goto ok
-			}
 		}
+	}
+	if err != nil {
+		fs.mu.Unlock()
+		fs.releaseHandle(fd, h)
 		return nil, err
 	}
-ok:
 	fs.open++
-	return &fileWrap{File: of, fs: fs, fd: fd}, nil
+	fs.mu.Unlock()
+	return &fileWrap{File: of, fs: fs, fd: fd, h: h}, nil
 }
 
 func (fs *fileStorage) Create(fd FileDesc) (Writer, error) {
@@ -503,17 +576,25 @@ func (fs *fileStorage) Create(fd FileDesc) (Writer, error) {
 		return nil, errReadOnly
 	}
 
+	h := fs.acquireHandle(fd)
+	// The file is being (re)created; cancel any pending removal.
+	atomic.StoreInt32(&h.removed, 0)
+
 	fs.mu.Lock()
-	defer fs.mu.Unlock()
 	if fs.open < 0 {
+		fs.mu.Unlock()
+		fs.releaseHandle(fd, h)
 		return nil, ErrClosed
 	}
 	of, err := os.OpenFile(filepath.Join(fs.path, fsGenName(fd)), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
+		fs.mu.Unlock()
+		fs.releaseHandle(fd, h)
 		return nil, err
 	}
 	fs.open++
-	return &fileWrap{File: of, fs: fs, fd: fd}, nil
+	fs.mu.Unlock()
+	return &fileWrap{File: of, fs: fs, fd: fd, h: h}, nil
 }
 
 func (fs *fileStorage) Remove(fd FileDesc) error {
@@ -525,20 +606,26 @@ func (fs *fileStorage) Remove(fd FileDesc) error {
 	}
 
 	fs.mu.Lock()
-	defer fs.mu.Unlock()
 	if fs.open < 0 {
+		fs.mu.Unlock()
 		return ErrClosed
 	}
-	err := os.Remove(filepath.Join(fs.path, fsGenName(fd)))
-	if err != nil {
-		if fsHasOldName(fd) && os.IsNotExist(err) {
-			if e1 := os.Remove(filepath.Join(fs.path, fsGenOldName(fd))); !os.IsNotExist(e1) {
-				fs.log(fmt.Sprintf("remove %s: %v (old name)", fd, err))
-				err = e1
-			}
-		} else {
-			fs.log(fmt.Sprintf("remove %s: %v", fd, err))
+	fs.mu.Unlock()
+
+	// Lock-free reference check: a file that is still referenced by open
+	// handles cannot be removed right away; mark it and defer the actual
+	// removal until the last handle is closed.
+	if v, ok := fs.handles.Load(fd); ok {
+		if h := v.(*fileHandleRef); atomic.LoadInt32(&h.refs) > 0 {
+			atomic.StoreInt32(&h.removed, 1)
+			fs.Log(fmt.Sprintf("remove %s: deferred, file still referenced", fd))
+			return nil
 		}
+	}
+
+	err := fs.removeFile(fd)
+	if err == nil || os.IsNotExist(err) {
+		fs.handles.Delete(fd)
 	}
 	return err
 }
@@ -585,6 +672,7 @@ type fileWrap struct {
 	*os.File
 	fs     *fileStorage
 	fd     FileDesc
+	h      *fileHandleRef
 	closed bool
 }
 
@@ -605,8 +693,8 @@ func (fw *fileWrap) Sync() error {
 
 func (fw *fileWrap) Close() error {
 	fw.fs.mu.Lock()
-	defer fw.fs.mu.Unlock()
 	if fw.closed {
+		fw.fs.mu.Unlock()
 		return ErrClosed
 	}
 	fw.closed = true
@@ -615,6 +703,10 @@ func (fw *fileWrap) Close() error {
 	if err != nil {
 		fw.fs.log(fmt.Sprintf("close %s: %v", fw.fd, err))
 	}
+	fw.fs.mu.Unlock()
+	// Release the handle reference; this triggers the actual removal if
+	// the file was marked for removal while still referenced.
+	fw.fs.releaseHandle(fw.fd, fw.h)
 	return err
 }
 

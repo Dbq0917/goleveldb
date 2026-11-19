@@ -9,6 +9,7 @@ package storage
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"testing"
 )
 
@@ -119,5 +120,61 @@ func TestMemStorageRename(t *testing.T) {
 		if !FileDescOk(fd) {
 			t.Errorf("Storage.List -> FileDescOk(%q)", fd)
 		}
+	}
+}
+
+func TestMemStorageDeferredRemove(t *testing.T) {
+	m := NewMemStorage()
+	fd := FileDesc{TypeTable, 1}
+
+	w, err := m.Create(fd)
+	if err != nil {
+		t.Fatal("Storage.Create: ", err)
+	}
+	if _, err := w.Write([]byte("abc")); err != nil {
+		t.Fatal("Storage.Write: ", err)
+	}
+	w.Close()
+
+	r, err := m.Open(fd)
+	if err != nil {
+		t.Fatal("Storage.Open: ", err)
+	}
+
+	// Removing a referenced file is deferred; the file is hidden from
+	// List and Open but stays readable through existing handles.
+	if err := m.Remove(fd); err != nil {
+		t.Fatal("Storage.Remove: ", err)
+	}
+	if fds, _ := m.List(TypeAll); len(fds) != 0 {
+		t.Fatal("invalid GetFiles len", len(fds))
+	}
+	if _, err := m.Open(fd); err == nil {
+		t.Fatal("expecting error")
+	}
+	buf := new(bytes.Buffer)
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatal("ReadFrom: got error: ", err)
+	}
+	if got := buf.String(); got != "abc" {
+		t.Fatalf("Read: invalid value, want=abc got=%s", got)
+	}
+
+	// Closing the last handle reclaims the file.
+	if err := r.Close(); err != nil {
+		t.Fatal("Storage.Close: ", err)
+	}
+	if err := m.Remove(fd); err != os.ErrNotExist {
+		t.Fatalf("expecting os.ErrNotExist, got %v", err)
+	}
+
+	// The file number can be reused afterwards.
+	w, err = m.Create(fd)
+	if err != nil {
+		t.Fatal("Storage.Create: ", err)
+	}
+	w.Close()
+	if fds, _ := m.List(TypeAll); len(fds) != 1 {
+		t.Fatal("invalid GetFiles len", len(fds))
 	}
 }

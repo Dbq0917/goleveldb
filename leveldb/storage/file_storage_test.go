@@ -73,6 +73,81 @@ func TestFileStorage_CreateFileName(t *testing.T) {
 	}
 }
 
+func TestFileStorage_DeferredRemove(t *testing.T) {
+	temp := tempDir(t)
+	defer os.RemoveAll(temp)
+	fs, err := OpenFile(temp, false)
+	if err != nil {
+		t.Fatal("OpenFile: got error: ", err)
+	}
+
+	fd := FileDesc{Type: TypeTable, Num: 1}
+	path := filepath.Join(temp, "000001.ldb")
+
+	w, err := fs.Create(fd)
+	if err != nil {
+		t.Fatal("Create: got error: ", err)
+	}
+	if _, err := w.Write([]byte("abc")); err != nil {
+		t.Fatal("Write: got error: ", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal("Close: got error: ", err)
+	}
+
+	// Removing an unreferenced file removes it right away.
+	if err := fs.Remove(fd); err != nil {
+		t.Fatal("Remove: got error: ", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("file should be removed, stat err=%v", err)
+	}
+
+	// Recreate the file and keep a handle open.
+	w, err = fs.Create(fd)
+	if err != nil {
+		t.Fatal("Create: got error: ", err)
+	}
+	if _, err := w.Write([]byte("abc")); err != nil {
+		t.Fatal("Write: got error: ", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal("Close: got error: ", err)
+	}
+	r, err := fs.Open(fd)
+	if err != nil {
+		t.Fatal("Open: got error: ", err)
+	}
+
+	// Removing a referenced file is deferred; the file stays until the
+	// last handle is closed.
+	if err := fs.Remove(fd); err != nil {
+		t.Fatal("Remove: got error: ", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal("file should still exist, stat err: ", err)
+	}
+	if _, err := fs.Open(fd); !os.IsNotExist(err) {
+		t.Fatalf("Open of removed file: want os.ErrNotExist, got %v", err)
+	}
+
+	// Closing the last handle reclaims the file.
+	if err := r.Close(); err != nil {
+		t.Fatal("Close: got error: ", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("file should be reclaimed, stat err=%v", err)
+	}
+	if err := fs.Remove(fd); !os.IsNotExist(err) {
+		t.Fatalf("Remove of reclaimed file: want os.ErrNotExist, got %v", err)
+	}
+
+	// The file number can be reused afterwards.
+	if _, err := fs.Create(fd); err != nil {
+		t.Fatal("Create: got error: ", err)
+	}
+}
+
 func TestFileStorage_MetaSetGet(t *testing.T) {
 	temp := tempDir(t)
 	fs, err := OpenFile(temp, false)
