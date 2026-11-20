@@ -655,6 +655,87 @@ func TestDB_GetFromFrozen(t *testing.T) {
 	h.get("k2", true)
 }
 
+func TestDB_WriteDuringMemCompaction(t *testing.T) {
+	h := newDbHarnessWopt(t, &opt.Options{
+		DisableLargeBatchTransaction: true,
+		WriteBuffer:                  100100,
+	})
+	defer h.close()
+
+	h.put("foo", "v1")
+	h.stor.Stall(testutil.ModeSync, storage.TypeTable)
+	defer h.stor.Release(testutil.ModeSync, storage.TypeTable)
+
+	big := strings.Repeat("x", 100000)
+	h.put("same", "v1")
+	h.put("k1", big)
+	h.put("k2", big)
+	for i := 0; h.db.getFrozenMemCount() == 0 && i < 100; i++ {
+		time.Sleep(10 * time.Microsecond)
+	}
+	if h.db.getFrozenMemCount() == 0 {
+		t.Fatal("No frozen mem")
+	}
+
+	writeC := make(chan error, 1)
+	go func() {
+		if err := h.db.Put([]byte("same"), []byte("v2"), nil); err != nil {
+			writeC <- err
+			return
+		}
+		if err := h.db.Put([]byte("k3"), []byte(big), nil); err != nil {
+			writeC <- err
+			return
+		}
+		writeC <- h.db.Put([]byte("k4"), []byte(big), nil)
+	}()
+	select {
+	case err := <-writeC:
+		if err != nil {
+			t.Fatal("Write during mem compaction: ", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Write blocked during mem compaction")
+	}
+
+	if n := h.db.getFrozenMemCount(); n < 3 {
+		t.Fatalf("Frozen mem count: got=%d want>=3", n)
+	}
+	h.getVal("foo", "v1")
+	h.getVal("k1", big)
+	h.getVal("k2", big)
+	h.getVal("k3", big)
+	h.getVal("k4", big)
+	h.getVal("same", "v2")
+
+	h.put("same", "v3")
+	h.getVal("same", "v3")
+
+	h.stor.Release(testutil.ModeSync, storage.TypeTable)
+	h.waitMemCompaction()
+
+	var stats DBStats
+	if err := h.db.Stats(&stats); err != nil {
+		t.Fatal(err)
+	}
+	if stats.MemCompDuration <= 0 {
+		t.Fatal("MemCompDuration was not recorded")
+	}
+	if value, err := h.db.GetProperty("leveldb.memcomp"); err != nil {
+		t.Fatal(err)
+	} else {
+		t.Log("memcomp property: ", value)
+	}
+
+	h.reopenDB()
+	h.getVal("foo", "v1")
+	h.getVal("k1", big)
+	h.getVal("k2", big)
+	h.getVal("k3", big)
+	h.getVal("k4", big)
+	h.getVal("same", "v3")
+}
+
 func TestDB_GetFromTable(t *testing.T) {
 	trun(t, func(h *dbHarness) {
 		h.put("foo", "v1")

@@ -267,31 +267,50 @@ func (db *DB) compactionCommit(name string, rec *sessionRecord) {
 }
 
 func (db *DB) memCompaction() {
-	mdb := db.getFrozenMem()
-	if mdb == nil {
-		return
-	}
-	defer mdb.decref()
+	for {
+		f, ok := db.getFrozenMemInfo()
+		if !ok {
+			return
+		}
 
+		// Pause table compaction.
+		resumeC := make(chan struct{})
+		select {
+		case db.tcompPauseC <- (chan<- struct{})(resumeC):
+		case <-db.compPerErrC:
+			close(resumeC)
+			resumeC = nil
+		case <-db.closeC:
+			db.compactionExitTransact()
+		}
+
+		db.memCompactionOne(f)
+		f.mem.decref()
+
+		// Resume table compaction.
+		if resumeC != nil {
+			select {
+			case <-resumeC:
+				close(resumeC)
+			case <-db.closeC:
+				db.compactionExitTransact()
+			}
+		}
+
+		// Trigger table compaction.
+		db.compTrigger(db.tcompCmdC)
+	}
+}
+
+func (db *DB) memCompactionOne(f frozenMem) {
+	mdb := f.mem
 	db.logf("memdb@flush N·%d S·%s", mdb.Len(), shortenb(int64(mdb.Size())))
 
 	// Don't compact empty memdb.
 	if mdb.Len() == 0 {
 		db.logf("memdb@flush skipping")
-		// drop frozen memdb
 		db.dropFrozenMem()
 		return
-	}
-
-	// Pause table compaction.
-	resumeC := make(chan struct{})
-	select {
-	case db.tcompPauseC <- (chan<- struct{})(resumeC):
-	case <-db.compPerErrC:
-		close(resumeC)
-		resumeC = nil
-	case <-db.closeC:
-		db.compactionExitTransact()
 	}
 
 	var (
@@ -316,8 +335,8 @@ func (db *DB) memCompaction() {
 		return nil
 	})
 
-	rec.setJournalNum(db.journalFd.Num)
-	rec.setSeqNum(db.frozenSeq)
+	rec.setJournalNum(db.getNextJournalNum())
+	rec.setSeqNum(f.seq)
 
 	// Commit.
 	stats.startTimer()
@@ -332,22 +351,10 @@ func (db *DB) memCompaction() {
 	}
 	db.compStats.addStat(flushLevel, stats)
 	atomic.AddUint32(&db.memComp, 1)
+	atomic.AddInt64(&db.cMemCompDuration, int64(stats.duration))
 
 	// Drop frozen memdb.
 	db.dropFrozenMem()
-
-	// Resume table compaction.
-	if resumeC != nil {
-		select {
-		case <-resumeC:
-			close(resumeC)
-		case <-db.closeC:
-			db.compactionExitTransact()
-		}
-	}
-
-	// Trigger table compaction.
-	db.compTrigger(db.tcompCmdC)
 }
 
 type tableCompactionBuilder struct {

@@ -7,7 +7,6 @@
 package leveldb
 
 import (
-	"errors"
 	"sync/atomic"
 	"time"
 
@@ -16,9 +15,11 @@ import (
 	"github.com/syndtr/goleveldb/leveldb/storage"
 )
 
-var (
-	errHasFrozenMem = errors.New("has frozen mem")
-)
+type frozenMem struct {
+	mem       *memDB
+	journalFd storage.FileDesc
+	seq       uint64
+}
 
 type memDB struct {
 	db *DB
@@ -130,10 +131,6 @@ func (db *DB) newMem(n int) (mem *memDB, err error) {
 	db.memMu.Lock()
 	defer db.memMu.Unlock()
 
-	if db.frozenMem != nil {
-		return nil, errHasFrozenMem
-	}
-
 	if db.journal == nil {
 		db.journal = journal.NewWriter(w)
 	} else {
@@ -143,23 +140,25 @@ func (db *DB) newMem(n int) (mem *memDB, err error) {
 		if err := db.journalWriter.Close(); err != nil {
 			return nil, err
 		}
-		db.frozenJournalFd = db.journalFd
+		if db.mem != nil {
+			db.frozenMems = append(db.frozenMems, frozenMem{
+				mem:       db.mem,
+				journalFd: db.journalFd,
+				seq:       db.seq,
+			})
+		}
 	}
 	db.journalWriter = w
 	db.journalFd = fd
-	db.frozenMem = db.mem
 	mem = db.mpoolGet(n)
 	mem.incref() // for self
 	mem.incref() // for caller
 	db.mem = mem
-	// The seq only incremented by the writer. And whoever called newMem
-	// should hold write lock, so no need additional synchronization here.
-	db.frozenSeq = db.seq
 	return
 }
 
 // Get all memdbs.
-func (db *DB) getMems() (e, f *memDB) {
+func (db *DB) getMems() (e *memDB, f []*memDB) {
 	db.memMu.RLock()
 	defer db.memMu.RUnlock()
 	if db.mem != nil {
@@ -167,10 +166,15 @@ func (db *DB) getMems() (e, f *memDB) {
 	} else if !db.isClosed() {
 		panic("nil effective mem")
 	}
-	if db.frozenMem != nil {
-		db.frozenMem.incref()
+	if len(db.frozenMems) > 0 {
+		f = make([]*memDB, len(db.frozenMems))
+		for i := range db.frozenMems {
+			m := db.frozenMems[len(db.frozenMems)-1-i].mem
+			m.incref()
+			f[i] = m
+		}
 	}
-	return db.mem, db.frozenMem
+	return db.mem, f
 }
 
 // Get effective memdb.
@@ -187,33 +191,71 @@ func (db *DB) getEffectiveMem() *memDB {
 
 // Get frozen memdb.
 func (db *DB) getFrozenMem() *memDB {
+	f, _ := db.getFrozenMemInfo()
+	return f.mem
+}
+
+func (db *DB) getFrozenMemInfo() (f frozenMem, ok bool) {
 	db.memMu.RLock()
 	defer db.memMu.RUnlock()
-	if db.frozenMem != nil {
-		db.frozenMem.incref()
+	if len(db.frozenMems) > 0 {
+		f = db.frozenMems[0]
+		f.mem.incref()
+		ok = true
 	}
-	return db.frozenMem
+	return
+}
+
+func (db *DB) getFrozenMemCount() int {
+	db.memMu.RLock()
+	n := len(db.frozenMems)
+	db.memMu.RUnlock()
+	return n
+}
+
+func (db *DB) getJournalNum() int64 {
+	db.memMu.RLock()
+	defer db.memMu.RUnlock()
+	if len(db.frozenMems) > 0 {
+		return db.frozenMems[0].journalFd.Num
+	}
+	return db.journalFd.Num
+}
+
+func (db *DB) getNextJournalNum() int64 {
+	db.memMu.RLock()
+	defer db.memMu.RUnlock()
+	if len(db.frozenMems) > 1 {
+		return db.frozenMems[1].journalFd.Num
+	}
+	return db.journalFd.Num
 }
 
 // Drop frozen memdb; assume that frozen memdb isn't nil.
 func (db *DB) dropFrozenMem() {
 	db.memMu.Lock()
-	if err := db.s.stor.Remove(db.frozenJournalFd); err != nil {
-		db.logf("journal@remove removing @%d %q", db.frozenJournalFd.Num, err)
-	} else {
-		db.logf("journal@remove removed @%d", db.frozenJournalFd.Num)
+	if len(db.frozenMems) == 0 {
+		db.memMu.Unlock()
+		panic("BUG: no frozen memdb")
 	}
-	db.frozenJournalFd = storage.FileDesc{}
-	db.frozenMem.decref()
-	db.frozenMem = nil
+	f := db.frozenMems[0]
+	db.frozenMems[0] = frozenMem{}
+	db.frozenMems = db.frozenMems[1:]
 	db.memMu.Unlock()
+
+	if err := db.s.stor.Remove(f.journalFd); err != nil {
+		db.logf("journal@remove removing @%d %q", f.journalFd.Num, err)
+	} else {
+		db.logf("journal@remove removed @%d", f.journalFd.Num)
+	}
+	f.mem.decref()
 }
 
 // Clear mems ptr; used by DB.Close().
 func (db *DB) clearMems() {
 	db.memMu.Lock()
 	db.mem = nil
-	db.frozenMem = nil
+	db.frozenMems = nil
 	db.memMu.Unlock()
 }
 

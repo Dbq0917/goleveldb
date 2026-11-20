@@ -30,11 +30,11 @@ func (mr *memdbReleaser) Release() {
 
 func (db *DB) newRawIterator(auxm *memDB, auxt tFiles, slice *util.Range, ro *opt.ReadOptions) iterator.Iterator {
 	strict := opt.GetStrict(db.s.o.Options, ro, opt.StrictReader)
-	em, fm := db.getMems()
+	em, fms := db.getMems()
 	v := db.s.version()
 
 	tableIts := v.getIterators(slice, ro)
-	n := len(tableIts) + len(auxt) + 3
+	n := len(tableIts) + len(auxt) + len(fms) + 2
 	its := make([]iterator.Iterator, 0, n)
 
 	if auxm != nil {
@@ -49,7 +49,7 @@ func (db *DB) newRawIterator(auxm *memDB, auxt tFiles, slice *util.Range, ro *op
 	emi := em.NewIterator(slice)
 	emi.SetReleaser(&memdbReleaser{m: em})
 	its = append(its, emi)
-	if fm != nil {
+	for _, fm := range fms {
 		fmi := fm.NewIterator(slice)
 		fmi.SetReleaser(&memdbReleaser{m: fm})
 		its = append(its, fmi)

@@ -35,6 +35,7 @@ type DB struct {
 
 	// Stats. Need 64-bit alignment.
 	cWriteDelay            int64 // The cumulative duration of write delays
+	cMemCompDuration       int64 // The cumulative duration of memdb compactions
 	cWriteDelayN           int32 // The cumulative number of write delays
 	inWritePaused          int32 // The indicator whether write operation is paused by compaction
 	aliveSnaps, aliveIters int32
@@ -49,14 +50,13 @@ type DB struct {
 	s *session
 
 	// MemDB.
-	memMu           sync.RWMutex
-	memPool         chan *memdb.DB
-	mem, frozenMem  *memDB
-	journal         *journal.Writer
-	journalWriter   storage.Writer
-	journalFd       storage.FileDesc
-	frozenJournalFd storage.FileDesc
-	frozenSeq       uint64
+	memMu         sync.RWMutex
+	memPool       chan *memdb.DB
+	mem           *memDB
+	frozenMems    []frozenMem
+	journal       *journal.Writer
+	journalWriter storage.Writer
+	journalFd     storage.FileDesc
 
 	// Snapshot.
 	snapsMu   sync.Mutex
@@ -111,7 +111,7 @@ func openDB(s *session) (*DB, error) {
 		// Compaction
 		tcompCmdC:   make(chan cCmd),
 		tcompPauseC: make(chan chan<- struct{}),
-		mcompCmdC:   make(chan cCmd),
+		mcompCmdC:   make(chan cCmd, 1),
 		compErrC:    make(chan error),
 		compPerErrC: make(chan error),
 		compErrSetC: make(chan error),
@@ -787,11 +787,15 @@ func (db *DB) get(auxm *memdb.DB, auxt tFiles, key []byte, seq uint64, ro *opt.R
 		}
 	}
 
-	em, fm := db.getMems()
-	for _, m := range [...]*memDB{em, fm} {
-		if m == nil {
-			continue
+	em, fms := db.getMems()
+	if em != nil {
+		defer em.decref()
+
+		if ok, mv, me := memGet(em.DB, ikey, db.s.icmp); ok {
+			return append([]byte(nil), mv...), me
 		}
+	}
+	for _, m := range fms {
 		defer m.decref()
 
 		if ok, mv, me := memGet(m.DB, ikey, db.s.icmp); ok {
@@ -825,11 +829,15 @@ func (db *DB) has(auxm *memdb.DB, auxt tFiles, key []byte, seq uint64, ro *opt.R
 		}
 	}
 
-	em, fm := db.getMems()
-	for _, m := range [...]*memDB{em, fm} {
-		if m == nil {
-			continue
+	em, fms := db.getMems()
+	if em != nil {
+		defer em.decref()
+
+		if ok, _, me := memGet(em.DB, ikey, db.s.icmp); ok {
+			return me == nil, nilIfNotFound(me)
 		}
+	}
+	for _, m := range fms {
 		defer m.decref()
 
 		if ok, _, me := memGet(m.DB, ikey, db.s.icmp); ok {
@@ -931,6 +939,7 @@ func (db *DB) GetSnapshot() (*Snapshot, error) {
 // GetProperty returns value of the given property name.
 //
 // Property names:
+//
 //	leveldb.num-files-at-level{n}
 //		Returns the number of files at level 'n'.
 //	leveldb.stats
@@ -939,6 +948,8 @@ func (db *DB) GetSnapshot() (*Snapshot, error) {
 //		Returns statistics of effective disk read and write.
 //	leveldb.writedelay
 //		Returns cumulative write delay caused by compaction.
+//	leveldb.memcomp
+//		Returns memdb compaction count and cumulative duration.
 //	leveldb.sstables
 //		Returns sstables list for each level.
 //	leveldb.blockpool
@@ -1012,6 +1023,10 @@ func (db *DB) GetProperty(name string) (value string, err error) {
 		writeDelayN, writeDelay := atomic.LoadInt32(&db.cWriteDelayN), time.Duration(atomic.LoadInt64(&db.cWriteDelay))
 		paused := atomic.LoadInt32(&db.inWritePaused) == 1
 		value = fmt.Sprintf("DelayN:%d Delay:%s Paused:%t", writeDelayN, writeDelay, paused)
+	case p == "memcomp":
+		memComp := atomic.LoadUint32(&db.memComp)
+		memCompDuration := time.Duration(atomic.LoadInt64(&db.cMemCompDuration))
+		value = fmt.Sprintf("MemComp:%d Duration:%s", memComp, memCompDuration)
 	case p == "sstables":
 		for level, tables := range v.levels {
 			value += fmt.Sprintf("--- level %d ---\n", level)
@@ -1064,10 +1079,11 @@ type DBStats struct {
 	LevelWrite        Sizes
 	LevelDurations    []time.Duration
 
-	MemComp       uint32
-	Level0Comp    uint32
-	NonLevel0Comp uint32
-	SeekComp      uint32
+	MemComp         uint32
+	MemCompDuration time.Duration
+	Level0Comp      uint32
+	NonLevel0Comp   uint32
+	SeekComp        uint32
 }
 
 // Stats populates s with database statistics.
@@ -1119,6 +1135,7 @@ func (db *DB) Stats(s *DBStats) error {
 		s.LevelTablesCounts = append(s.LevelTablesCounts, len(tables))
 	}
 	s.MemComp = atomic.LoadUint32(&db.memComp)
+	s.MemCompDuration = time.Duration(atomic.LoadInt64(&db.cMemCompDuration))
 	s.Level0Comp = atomic.LoadUint32(&db.level0Comp)
 	s.NonLevel0Comp = atomic.LoadUint32(&db.nonLevel0Comp)
 	s.SeekComp = atomic.LoadUint32(&db.seekComp)

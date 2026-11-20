@@ -56,17 +56,14 @@ func (db *DB) checkAndCleanFiles() error {
 
 	var nt int
 	var rem []storage.FileDesc
+	journalNum := db.getJournalNum()
 	for _, fd := range fds {
 		keep := true
 		switch fd.Type {
 		case storage.TypeManifest:
 			keep = fd.Num >= db.s.manifestFd.Num
 		case storage.TypeJournal:
-			if !db.frozenJournalFd.Zero() {
-				keep = fd.Num >= db.frozenJournalFd.Num
-			} else {
-				keep = fd.Num >= db.journalFd.Num
-			}
+			keep = fd.Num >= journalNum
 		case storage.TypeTable:
 			_, keep = tmap[fd.Num]
 			if keep {
