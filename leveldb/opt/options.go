@@ -344,6 +344,8 @@ type Options struct {
 	// Filter can be changed after a DB has been created. It is recommended
 	// to put old filter to the 'alternative filters' to mitigate lack of
 	// filter during transition period.
+	// The filter of an open DB can be swapped at runtime with DB.SetFilter
+	// and existing tables can be rebuilt with DB.RebuildFilters.
 	//
 	// A filter is used to reduce disk reads when looking for a specific key.
 	//

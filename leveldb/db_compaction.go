@@ -657,6 +657,45 @@ func (db *DB) tableAutoCompaction() {
 	}
 }
 
+// RebuildFilters rebuilds the filters of all existing tables using the
+// current effective filter (see SetFilter). This trades a one-time full
+// table rewrite for a different filter memory/accuracy balance without
+// recreating the DB.
+//
+// The rebuild runs through the regular compaction machinery, so reads
+// and writes remain available while it is in progress; RebuildFilters
+// merely blocks the caller until the rebuild is done.
+//
+// Note that the bottom-most level is rewritten into a new, deeper level,
+// since range compaction alone never rewrites the bottom-most level.
+func (db *DB) RebuildFilters() error {
+	if err := db.ok(); err != nil {
+		return err
+	}
+
+	// Compact all tables down to the bottom-most level, rewriting the
+	// filters of every non-bottom table with the effective filter.
+	if err := db.compTriggerRange(db.tcompCmdC, -1, nil, nil); err != nil {
+		return err
+	}
+
+	// Range compaction never rewrites the bottom-most level, so rewrite
+	// it explicitly into a new level.
+	v := db.s.version()
+	bottom := -1
+	for i := len(v.levels) - 1; i >= 0; i-- {
+		if len(v.levels[i]) > 0 {
+			bottom = i
+			break
+		}
+	}
+	v.release()
+	if bottom < 0 {
+		return nil
+	}
+	return db.compTriggerRange(db.tcompCmdC, bottom, nil, nil)
+}
+
 func (db *DB) tableNeedCompaction() bool {
 	v := db.s.version()
 	defer v.release()

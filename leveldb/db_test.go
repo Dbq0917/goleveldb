@@ -1745,6 +1745,120 @@ func TestDB_BloomFilter(t *testing.T) {
 	h.stor.Release(testutil.ModeSync, storage.TypeTable)
 }
 
+func TestDB_FilterRebuild(t *testing.T) {
+	h := newDbHarnessWopt(t, &opt.Options{
+		DisableLargeBatchTransaction: true,
+		DisableBlockCache:            true,
+		Filter:                       filter.NewBloomFilter(1),
+	})
+	defer h.close()
+
+	key := func(i int) string {
+		return fmt.Sprintf("key%06d", i)
+	}
+
+	const n = 10000
+
+	// Populate and compact everything into a single layer.
+	for i := 0; i < n; i++ {
+		h.put(key(i), key(i))
+	}
+	h.compactMem()
+	h.stor.ResetCounter(testutil.ModeWrite, storage.TypeTable)
+	h.compactRange("", "")
+	_, coarseBytes := h.stor.Counter(testutil.ModeWrite, storage.TypeTable)
+
+	// Prevent auto compactions triggered by seeks.
+	h.stor.Stall(testutil.ModeSync, storage.TypeTable)
+
+	// Coarse (memory-saving) filter: most missing keys fall through to
+	// the table.
+	h.stor.ResetCounter(testutil.ModeRead, storage.TypeTable)
+	for i := 0; i < n; i++ {
+		h.get(key(i)+".missing", false)
+	}
+	coarseCnt, _ := h.stor.Counter(testutil.ModeRead, storage.TypeTable)
+	t.Logf("coarse filter: lookup of %d missing keys yield %d sstable I/O reads, tables written %d bytes", n, coarseCnt, coarseBytes)
+	if min := n / 3; coarseCnt < min {
+		t.Errorf("num of sstable I/O reads of missing keys less than %d, got %d", min, coarseCnt)
+	}
+
+	// Swap in an accurate filter. Old tables keep their coarse filters
+	// until rebuilt.
+	if err := h.db.SetFilter(filter.NewBloomFilter(14)); err != nil {
+		t.Fatal("SetFilter: ", err)
+	}
+	h.stor.ResetCounter(testutil.ModeRead, storage.TypeTable)
+	for i := 0; i < n; i++ {
+		h.get(key(i)+".missing", false)
+	}
+	staleCnt, _ := h.stor.Counter(testutil.ModeRead, storage.TypeTable)
+	t.Logf("swapped but not rebuilt: lookup of %d missing keys yield %d sstable I/O reads", n, staleCnt)
+	if min := n / 3; staleCnt < min {
+		t.Errorf("num of sstable I/O reads of missing keys less than %d, got %d", min, staleCnt)
+	}
+
+	// Rebuild all tables with the accurate filter, without closing the DB.
+	h.stor.Release(testutil.ModeSync, storage.TypeTable)
+	h.stor.ResetCounter(testutil.ModeWrite, storage.TypeTable)
+	if err := h.db.RebuildFilters(); err != nil {
+		t.Fatal("RebuildFilters: ", err)
+	}
+	_, fineBytes := h.stor.Counter(testutil.ModeWrite, storage.TypeTable)
+	h.stor.Stall(testutil.ModeSync, storage.TypeTable)
+
+	// Accurate filter: bigger footprint, but missing keys almost never
+	// fall through to the table.
+	h.stor.ResetCounter(testutil.ModeRead, storage.TypeTable)
+	for i := 0; i < n; i++ {
+		h.get(key(i)+".missing", false)
+	}
+	fineCnt, _ := h.stor.Counter(testutil.ModeRead, storage.TypeTable)
+	t.Logf("fine filter: lookup of %d missing keys yield %d sstable I/O reads, tables written %d bytes", n, fineCnt, fineBytes)
+	if max := n / 100; fineCnt > max {
+		t.Errorf("num of sstable I/O reads of missing keys was more than %d, got %d", max, fineCnt)
+	}
+	if fineBytes <= coarseBytes {
+		t.Errorf("accurate filter should occupy more space than coarse filter, coarse=%d fine=%d", coarseBytes, fineBytes)
+	}
+
+	// Present keys must still be found after the rebuild.
+	for i := 0; i < n; i += 100 {
+		h.getVal(key(i), key(i))
+	}
+
+	// A rebuild must not interrupt concurrent reads and writes. Hold the
+	// rebuild mid-compaction by stalling table syncs, then keep reading
+	// and writing.
+	if err := h.db.SetFilter(filter.NewBloomFilter(6)); err != nil {
+		t.Fatal("SetFilter: ", err)
+	}
+	var (
+		wg         sync.WaitGroup
+		rebuildErr error
+	)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		rebuildErr = h.db.RebuildFilters()
+	}()
+	for i := 0; i < 1000; i++ {
+		h.get(key(i), true)
+		h.get(key(i)+".missing", false)
+	}
+	for i := 0; i < 100; i++ {
+		h.put(key(i), key(i))
+	}
+	h.stor.Release(testutil.ModeSync, storage.TypeTable)
+	wg.Wait()
+	if rebuildErr != nil {
+		t.Fatal("RebuildFilters: ", rebuildErr)
+	}
+	for i := 0; i < 100; i++ {
+		h.getVal(key(i), key(i))
+	}
+}
+
 func TestDB_Concurrent(t *testing.T) {
 	const n, secs, maxkey = 4, 6, 1000
 	h := newDbHarness(t)

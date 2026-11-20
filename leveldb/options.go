@@ -41,6 +41,7 @@ func (s *session) setOptions(o *opt.Options) {
 
 	s.o = &cachedOptions{Options: no}
 	s.o.cache()
+	s.setFilter(no.Filter)
 }
 
 const optCachedLevel = 7

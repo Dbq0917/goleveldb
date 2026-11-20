@@ -19,6 +19,7 @@ import (
 
 	"github.com/syndtr/goleveldb/leveldb/cache"
 	"github.com/syndtr/goleveldb/leveldb/errors"
+	"github.com/syndtr/goleveldb/leveldb/filter"
 	"github.com/syndtr/goleveldb/leveldb/iterator"
 	"github.com/syndtr/goleveldb/leveldb/journal"
 	"github.com/syndtr/goleveldb/leveldb/memdb"
@@ -926,6 +927,33 @@ func (db *DB) GetSnapshot() (*Snapshot, error) {
 	}
 
 	return db.newSnapshot(), nil
+}
+
+// SetFilter swaps the effective filter at runtime. A nil filter disables
+// filtering.
+//
+// The new filter takes effect immediately for newly created tables and
+// for tables opened after the call. Tables that already exist keep their
+// previously generated filters until they are rebuilt, either gradually
+// by automatic compactions or at once by calling RebuildFilters. Because
+// the builtin bloom filter serializes its parameters into each filter
+// block, reads against old tables remain correct (albeit with the old
+// false-positive rate) after changing filter.NewBloomFilter's bitsPerKey.
+//
+// The filter set here is not persisted; opt.Options.Filter applies again
+// when the DB is reopened.
+//
+// It is safe to call SetFilter concurrently with reads and writes.
+func (db *DB) SetFilter(f filter.Filter) error {
+	if err := db.ok(); err != nil {
+		return err
+	}
+	if f == nil {
+		db.s.setFilter(nil)
+	} else {
+		db.s.setFilter(&iFilter{f})
+	}
+	return nil
 }
 
 // GetProperty returns value of the given property name.

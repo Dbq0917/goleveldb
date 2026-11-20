@@ -353,6 +353,14 @@ type tOps struct {
 	blockBuffer  *util.BufferPool
 }
 
+// options returns the session options with the current effective filter,
+// which may have been swapped at runtime via DB.SetFilter.
+func (t *tOps) options() *opt.Options {
+	o := *t.s.o.Options
+	o.Filter = t.s.getFilter()
+	return &o
+}
+
 // Creates an empty table and returns table writer.
 func (t *tOps) create(tSize int) (*tWriter, error) {
 	fd := storage.FileDesc{Type: storage.TypeTable, Num: t.s.allocFileNum()}
@@ -364,7 +372,7 @@ func (t *tOps) create(tSize int) (*tWriter, error) {
 		t:  t,
 		fd: fd,
 		w:  fw,
-		tw: table.NewWriter(fw, t.s.o.Options, t.blockBuffer, tSize),
+		tw: table.NewWriter(fw, t.options(), t.blockBuffer, tSize),
 	}, nil
 }
 
@@ -415,7 +423,7 @@ func (t *tOps) open(f *tFile) (ch *cache.Handle, err error) {
 		}
 
 		var tr *table.Reader
-		tr, err = table.NewReader(r, f.size, f.fd, blockCache, t.blockBuffer, t.s.o.Options)
+		tr, err = table.NewReader(r, f.size, f.fd, blockCache, t.blockBuffer, t.options())
 		if err != nil {
 			_ = r.Close()
 			return 0, nil

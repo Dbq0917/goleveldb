@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/syndtr/goleveldb/leveldb/errors"
 	"github.com/syndtr/goleveldb/leveldb/journal"
@@ -47,6 +48,10 @@ type session struct {
 	o        *cachedOptions
 	icmp     *iComparer
 	tops     *tOps
+
+	// Current effective filter; stores effectiveFilter. Initialized from
+	// the options and may be swapped at runtime via DB.SetFilter.
+	filterC atomic.Value
 
 	manifest       *journal.Writer
 	manifestWriter storage.Writer
