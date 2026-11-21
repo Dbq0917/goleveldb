@@ -29,14 +29,25 @@ func (s *session) pickMemdbLevel(umin, umax []byte, maxLevel int) int {
 }
 
 func (s *session) flushMemdb(rec *sessionRecord, mdb *memdb.DB, maxLevel int) (int, error) {
-	// Create sorted table.
-	iter := mdb.NewIterator(nil)
-	defer iter.Release()
-	t, n, err := s.tops.createFrom(iter)
+	t, n, err := s.createMemdbTable(mdb)
 	if err != nil {
 		return 0, err
 	}
+	return s.addMemdbTable(rec, t, n, maxLevel, false), nil
+}
 
+func (s *session) createMemdbTable(mdb *memdb.DB) (t *tFile, n int, err error) {
+	// Create sorted table.
+	iter := mdb.NewIterator(nil)
+	defer iter.Release()
+	t, n, err = s.tops.createFrom(iter)
+	if err != nil {
+		return nil, 0, err
+	}
+	return t, n, nil
+}
+
+func (s *session) addMemdbTable(rec *sessionRecord, t *tFile, n, maxLevel int, forceL0 bool) int {
 	// Pick level other than zero can cause compaction issue with large
 	// bulk insert and delete on strictly incrementing key-space. The
 	// problem is that the small deletion markers trapped at lower level,
@@ -45,11 +56,14 @@ func (s *session) flushMemdb(rec *sessionRecord, mdb *memdb.DB, maxLevel int) (i
 	// higher level, thus maximum possible level is always picked, while
 	// overlapping deletion marker pushed into lower level.
 	// See: https://github.com/syndtr/goleveldb/issues/127.
-	flushLevel := s.pickMemdbLevel(t.imin.ukey(), t.imax.ukey(), maxLevel)
+	flushLevel := 0
+	if !forceL0 {
+		flushLevel = s.pickMemdbLevel(t.imin.ukey(), t.imax.ukey(), maxLevel)
+	}
 	rec.addTableFile(flushLevel, t)
 
 	s.logf("memdb@flush created L%d@%d N·%d S·%s %q:%q", flushLevel, t.fd.Num, n, shortenb(t.size), t.imin, t.imax)
-	return flushLevel, nil
+	return flushLevel
 }
 
 // Pick a compaction based on current state; need external synchronization.

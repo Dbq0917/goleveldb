@@ -81,6 +81,7 @@ type DB struct {
 	compPerErrC      chan error
 	compErrSetC      chan error
 	compWriteLocking bool
+	tcompActive      bool // protected by compCommitLk
 	compStats        cStats
 	memdbMaxLevel    int // For testing.
 

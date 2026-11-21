@@ -9,6 +9,7 @@ package leveldb
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/syndtr/goleveldb/leveldb/iterator"
@@ -242,8 +243,7 @@ func (tr *Transaction) Commit() error {
 		tr.db.compTrigger(tr.db.tcompCmdC)
 		tr.db.compCommitLk.Unlock()
 
-		// Additionally, wait compaction when certain threshold reached.
-		// Ignore error, returns error only if transaction can't be committed.
+		// Additionally, trigger compaction when certain threshold reached.
 		_ = tr.db.waitCompaction()
 	}
 	// Only mark as done if transaction committed successfully.
@@ -276,7 +276,10 @@ func (tr *Transaction) Discard() {
 
 func (db *DB) waitCompaction() error {
 	if db.s.tLen(0) >= db.s.o.GetWriteL0PauseTrigger() {
-		return db.compTriggerWait(db.tcompCmdC)
+		atomic.StoreInt32(&db.inWritePaused, 1)
+		_, err := db.compTriggerWaitTimeout(db.tcompCmdC, maxWritePause)
+		atomic.StoreInt32(&db.inWritePaused, 0)
+		return err
 	}
 	return nil
 }

@@ -398,8 +398,10 @@ type Options struct {
 	// The default value is 4MiB.
 	WriteBuffer int
 
-	// WriteL0StopTrigger defines number of 'sorted table' at level-0 that will
-	// pause write.
+	// WriteL0PauseTrigger defines number of 'sorted table' at level-0 at which
+	// writers briefly yield to table compaction. Writers wait for at most a
+	// short fixed budget, then continue while compaction catches up in the
+	// background.
 	//
 	// The default value is 12.
 	WriteL0PauseTrigger int

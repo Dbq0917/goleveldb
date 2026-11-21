@@ -15,6 +15,11 @@ import (
 	"github.com/syndtr/goleveldb/leveldb/util"
 )
 
+// maxWritePause bounds how long a writer yields to level-0 compaction. Once
+// the budget is exhausted, writes continue and compaction converges in the
+// background.
+const maxWritePause = 10 * time.Millisecond
+
 func (db *DB) writeJournal(batches []*Batch, seq uint64, sync bool) error {
 	wr, err := db.journal.Next()
 	if err != nil {
@@ -65,6 +70,7 @@ retry:
 
 func (db *DB) flush(n int) (mdb *memDB, mdbFree int, err error) {
 	delayed := false
+	pauseWaited := false
 	slowdownTrigger := db.s.o.GetWriteL0SlowdownTrigger()
 	pauseTrigger := db.s.o.GetWriteL0PauseTrigger()
 	flush := func() (retry bool) {
@@ -84,19 +90,20 @@ func (db *DB) flush(n int) (mdb *memDB, mdbFree int, err error) {
 		switch {
 		case tLen >= slowdownTrigger && !delayed:
 			delayed = true
+			db.compTrigger(db.tcompCmdC)
 			time.Sleep(time.Millisecond)
 		case mdbFree >= n:
 			return false
-		case tLen >= pauseTrigger:
+		case tLen >= pauseTrigger && !pauseWaited:
+			pauseWaited = true
 			delayed = true
-			// Set the write paused flag explicitly.
 			atomic.StoreInt32(&db.inWritePaused, 1)
-			err = db.compTriggerWait(db.tcompCmdC)
-			// Unset the write paused flag.
+			_, err = db.compTriggerWaitTimeout(db.tcompCmdC, maxWritePause)
 			atomic.StoreInt32(&db.inWritePaused, 0)
 			if err != nil {
 				return false
 			}
+			return true
 		default:
 			// Allow memdb to grow if it has no entry.
 			if mdb.Len() == 0 {

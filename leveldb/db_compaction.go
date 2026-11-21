@@ -261,6 +261,11 @@ func (db *DB) compactionExitTransact() {
 func (db *DB) compactionCommit(name string, rec *sessionRecord) {
 	db.compCommitLk.Lock()
 	defer db.compCommitLk.Unlock() // Defer is necessary.
+	db.compactionCommitLocked(name, rec)
+}
+
+func (db *DB) compactionCommitLocked(name string, rec *sessionRecord) {
+	// Caller must hold compCommitLk.
 	db.compactionTransactFunc(name+"@commit", func(cnt *compactionTransactCounter) error {
 		return db.s.commit(rec, true)
 	}, nil)
@@ -283,30 +288,28 @@ func (db *DB) memCompaction() {
 		return
 	}
 
-	// Pause table compaction.
-	resumeC := make(chan struct{})
-	select {
-	case db.tcompPauseC <- (chan<- struct{})(resumeC):
-	case <-db.compPerErrC:
-		close(resumeC)
-		resumeC = nil
-	case <-db.closeC:
-		db.compactionExitTransact()
-	}
-
 	var (
 		rec        = &sessionRecord{}
 		stats      = &cStatStaging{}
 		flushLevel int
+		table      *tFile
+		tableN     int
 	)
 
 	// Generate tables.
 	db.compactionTransactFunc("memdb@flush", func(cnt *compactionTransactCounter) (err error) {
 		stats.startTimer()
-		flushLevel, err = db.s.flushMemdb(rec, mdb.DB, db.memdbMaxLevel)
+		table, tableN, err = db.s.createMemdbTable(mdb.DB)
 		stats.stopTimer()
-		return
+		return err
 	}, func() error {
+		if table != nil {
+			db.logf("memdb@flush revert @%d", table.fd.Num)
+			if err := db.s.stor.Remove(table.fd); err != nil {
+				return err
+			}
+			table = nil
+		}
 		for _, r := range rec.addedTables {
 			db.logf("memdb@flush revert @%d", r.num)
 			if err := db.s.stor.Remove(storage.FileDesc{Type: storage.TypeTable, Num: r.num}); err != nil {
@@ -319,10 +322,18 @@ func (db *DB) memCompaction() {
 	rec.setJournalNum(db.journalFd.Num)
 	rec.setSeqNum(db.frozenSeq)
 
-	// Commit.
-	stats.startTimer()
-	db.compactionCommit("memdb", rec)
-	stats.stopTimer()
+	func() {
+		db.compCommitLk.Lock()
+		defer db.compCommitLk.Unlock()
+
+		// If a table compaction is running, keep memdb output in level-0 so
+		// that the two commits can proceed concurrently without making two
+		// overlapping tables in the same level.
+		flushLevel = db.s.addMemdbTable(rec, table, tableN, db.memdbMaxLevel, db.tcompActive)
+		stats.startTimer()
+		db.compactionCommitLocked("memdb", rec)
+		stats.stopTimer()
+	}()
 
 	db.logf("memdb@flush committed F·%d T·%v", len(rec.addedTables), stats.duration)
 
@@ -335,16 +346,6 @@ func (db *DB) memCompaction() {
 
 	// Drop frozen memdb.
 	db.dropFrozenMem()
-
-	// Resume table compaction.
-	if resumeC != nil {
-		select {
-		case <-resumeC:
-			close(resumeC)
-		case <-db.closeC:
-			db.compactionExitTransact()
-		}
-	}
 
 	// Trigger table compaction.
 	db.compTrigger(db.tcompCmdC)
@@ -614,6 +615,15 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool) {
 }
 
 func (db *DB) tableRangeCompaction(level int, umin, umax []byte) error {
+	db.compCommitLk.Lock()
+	db.tcompActive = true
+	db.compCommitLk.Unlock()
+	defer func() {
+		db.compCommitLk.Lock()
+		db.tcompActive = false
+		db.compCommitLk.Unlock()
+	}()
+
 	db.logf("table@compaction range L%d %q:%q", level, umin, umax)
 	if level >= 0 {
 		if c := db.s.getCompactionRange(level, umin, umax, true); c != nil {
@@ -652,9 +662,22 @@ func (db *DB) tableRangeCompaction(level int, umin, umax []byte) error {
 }
 
 func (db *DB) tableAutoCompaction() {
-	if c := db.s.pickCompaction(); c != nil {
-		db.tableCompaction(c, false)
+	db.compCommitLk.Lock()
+	db.tcompActive = true
+	c := db.s.pickCompaction()
+	db.compCommitLk.Unlock()
+	if c == nil {
+		db.compCommitLk.Lock()
+		db.tcompActive = false
+		db.compCommitLk.Unlock()
+		return
 	}
+	defer func() {
+		db.compCommitLk.Lock()
+		db.tcompActive = false
+		db.compCommitLk.Unlock()
+	}()
+	db.tableCompaction(c, false)
 }
 
 func (db *DB) tableNeedCompaction() bool {
@@ -739,6 +762,33 @@ func (db *DB) compTriggerWait(compC chan<- cCmd) (err error) {
 		return ErrClosed
 	}
 	return err
+}
+
+// compTriggerWaitTimeout triggers a compaction and waits at most timeout for it.
+// The compaction command remains queued after a timeout; its buffered ack
+// channel lets the compaction goroutine finish without blocking.
+func (db *DB) compTriggerWaitTimeout(compC chan<- cCmd, timeout time.Duration) (waited bool, err error) {
+	ch := make(chan error, 1)
+	select {
+	case compC <- cAuto{ch}:
+	case err = <-db.compErrC:
+		return false, err
+	case <-db.closeC:
+		return false, ErrClosed
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err = <-ch:
+		return true, err
+	case err = <-db.compErrC:
+		return false, err
+	case <-db.closeC:
+		return false, ErrClosed
+	case <-timer.C:
+		return false, nil
+	}
 }
 
 // Send range compaction request.
