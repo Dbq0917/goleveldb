@@ -147,6 +147,51 @@ func TestBatch(t *testing.T) {
 	t.Logf("length=%d internalLen=%d", len(kvs), internalLen)
 }
 
+func TestBatchDumpRemainsStableAfterReset(t *testing.T) {
+	batch := MakeBatch(1024)
+	batch.Put([]byte("first"), []byte("first-value"))
+	dump := batch.Dump()
+	want := append([]byte(nil), dump...)
+
+	batch.Reset()
+	batch.Put([]byte("second"), bytes.Repeat([]byte("second-value"), 100))
+
+	if !bytes.Equal(dump, want) {
+		t.Fatal("dumped batch changed after the batch was reused")
+	}
+}
+
+func TestBatchReuseDoesNotCorruptPersistedBatches(t *testing.T) {
+	h := newDbHarness(t)
+	defer h.close()
+
+	firstValue := bytes.Repeat([]byte("first-value"), 100)
+	secondValue := bytes.Repeat([]byte("second-value"), 100)
+
+	source := MakeBatch(1024)
+	source.Put([]byte("first"), firstValue)
+
+	first := new(Batch)
+	if err := first.Load(source.Dump()); err != nil {
+		t.Fatal(err)
+	}
+
+	source.Reset()
+	source.Put([]byte("second"), secondValue)
+
+	second := new(Batch)
+	if err := second.Load(source.Dump()); err != nil {
+		t.Fatal(err)
+	}
+
+	h.write(first)
+	h.write(second)
+	h.reopenDB()
+
+	h.getVal("first", string(firstValue))
+	h.getVal("second", string(secondValue))
+}
+
 func BenchmarkDefaultBatchWrite(b *testing.B) {
 	benchmarkBatchWrite(b, nil)
 }

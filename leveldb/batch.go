@@ -63,6 +63,10 @@ type Batch struct {
 	data  []byte
 	index []batchIndex
 
+	// shared reports whether data may be referenced by a slice returned from
+	// Dump. The backing array must be detached before it is modified.
+	shared bool
+
 	// internalLen is sums of key/value pair length plus 8-bytes internal key.
 	internalLen int
 
@@ -75,7 +79,7 @@ type Batch struct {
 
 func (b *Batch) grow(n int) {
 	o := len(b.data)
-	if cap(b.data)-o < n {
+	if b.shared || cap(b.data)-o < n {
 		limit := batchGrowLimit
 		if b.growLimit > 0 {
 			limit = b.growLimit
@@ -87,6 +91,7 @@ func (b *Batch) grow(n int) {
 		ndata := make([]byte, o, o+n+o/div)
 		copy(ndata, b.data)
 		b.data = ndata
+		b.shared = false
 	}
 }
 
@@ -133,17 +138,26 @@ func (b *Batch) Delete(key []byte) {
 // Dump dumps batch contents. The returned slice can be loaded into the
 // batch using Load method.
 // The returned slice is not its own copy, so the contents should not be
-// modified.
+// modified. The batch detaches its buffer before the next mutation, so the
+// returned slice remains stable across Reset and subsequent writes.
 func (b *Batch) Dump() []byte {
+	b.shared = true
 	return b.data
 }
 
 // Load loads given slice into the batch. Previous contents of the batch
 // will be discarded.
-// The given slice will not be copied and will be used as batch buffer, so
-// it is not safe to modify the contents of the slice.
+// The given slice will be copied, so it is safe to modify the contents of the
+// slice after Load returns.
 func (b *Batch) Load(data []byte) error {
-	return b.decode(data, -1)
+	if b.shared || cap(b.data) < len(data) {
+		b.data = make([]byte, len(data))
+	} else {
+		b.data = b.data[:len(data)]
+	}
+	copy(b.data, data)
+	b.shared = false
+	return b.decode(b.data, -1)
 }
 
 // Replay replays batch contents.
@@ -166,7 +180,12 @@ func (b *Batch) Len() int {
 
 // Reset resets the batch.
 func (b *Batch) Reset() {
-	b.data = b.data[:0]
+	if b.shared {
+		b.data = nil
+		b.shared = false
+	} else {
+		b.data = b.data[:0]
+	}
 	b.index = b.index[:0]
 	b.internalLen = 0
 }
@@ -183,6 +202,7 @@ func (b *Batch) replayInternal(fn func(i int, kt keyType, k, v []byte) error) er
 func (b *Batch) append(p *Batch) {
 	ob := len(b.data)
 	oi := len(b.index)
+	b.grow(len(p.data))
 	b.data = append(b.data, p.data...)
 	b.index = append(b.index, p.index...)
 	b.internalLen += p.internalLen
